@@ -1,123 +1,126 @@
-import os
-from datetime import datetime
-
-from flask import Flask, redirect, render_template, request, send_from_directory, url_for
-from flask_migrate import Migrate
+from flask import Flask, request, render_template, redirect, url_for, flash, send_file
 from flask_sqlalchemy import SQLAlchemy
 from flask_wtf.csrf import CSRFProtect
+from flask_migrate import Migrate
+from azure.storage.blob import BlobServiceClient
+import os
 
+# Initialize Flask app and configurations
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///restaurants.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SECRET_KEY'] = 'your_secret_key'
 
-app = Flask(__name__, static_folder='static')
+# Initialize CSRF protection
 csrf = CSRFProtect(app)
 
-# WEBSITE_HOSTNAME exists only in production environment
-if 'WEBSITE_HOSTNAME' not in os.environ:
-    # local development, where we'll use environment variables
-    print("Loading config.development and environment variables from .env file.")
-    app.config.from_object('azureproject.development')
-else:
-    # production
-    print("Loading config.production.")
-    app.config.from_object('azureproject.production')
-
-app.config.update(
-    SQLALCHEMY_DATABASE_URI=app.config.get('DATABASE_URI'),
-    SQLALCHEMY_TRACK_MODIFICATIONS=False,
-)
-
-# Initialize the database connection
+# Initialize database and migration
 db = SQLAlchemy(app)
-
-# Enable Flask-Migrate commands "flask db init/migrate/upgrade" to work
 migrate = Migrate(app, db)
 
-# The import must be done after db initialization due to circular import issue
-from models import Restaurant, Review
+# Azure Blob Storage Configuration
+AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+AZURE_STORAGE_CONTAINER_NAME = os.getenv("AZURE_STORAGE_CONTAINER_NAME")
+blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+container_client = blob_service_client.get_container_client(AZURE_STORAGE_CONTAINER_NAME)
 
-@app.route('/', methods=['GET'])
+# Database Models
+class Restaurant(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(80), nullable=False)
+    description = db.Column(db.String(200), nullable=True)
+    image = db.Column(db.String(200), nullable=True)
+
+class Review(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    restaurant_id = db.Column(db.Integer, db.ForeignKey('restaurant.id'), nullable=False)
+    rating = db.Column(db.Integer, nullable=False)
+    comment = db.Column(db.String(300), nullable=True)
+
+# Utility function to get average star rating
+@app.context_processor
+def utility_processor():
+    def star_rating(reviews):
+        if not reviews:
+            return "No ratings yet"
+        total = sum([r.rating for r in reviews])
+        return round(total / len(reviews), 1)
+    return dict(star_rating=star_rating)
+
+# Routes
+@app.route('/')
 def index():
-    print('Request for index page received')
     restaurants = Restaurant.query.all()
     return render_template('index.html', restaurants=restaurants)
 
-@app.route('/<int:id>', methods=['GET'])
+@app.route('/details/<int:id>')
 def details(id):
-    restaurant = Restaurant.query.where(Restaurant.id == id).first()
-    reviews = Review.query.where(Review.restaurant == id)
+    restaurant = Restaurant.query.get_or_404(id)
+    reviews = Review.query.filter_by(restaurant_id=id).all()
     return render_template('details.html', restaurant=restaurant, reviews=reviews)
 
-@app.route('/create', methods=['GET'])
+@app.route('/create_restaurant')
 def create_restaurant():
-    print('Request for add restaurant page received')
     return render_template('create_restaurant.html')
 
-@app.route('/add', methods=['POST'])
-@csrf.exempt
+@app.route('/add_restaurant', methods=['POST'])
 def add_restaurant():
-    try:
-        name = request.values.get('restaurant_name')
-        street_address = request.values.get('street_address')
-        description = request.values.get('description')
-    except (KeyError):
-        # Redisplay the question voting form.
-        return render_template('add_restaurant.html', {
-            'error_message': "You must include a restaurant name, address, and description",
-        })
+    name = request.form['name']
+    description = request.form['description']
+    image = request.files['image']
+
+    # Upload image to Azure Blob Storage
+    if image:
+        blob_client = container_client.get_blob_client(image.filename)
+        blob_client.upload_blob(image, overwrite=True)
+        image_url = f"https://{container_client.account_name}.blob.core.windows.net/{AZURE_STORAGE_CONTAINER_NAME}/{image.filename}"
     else:
-        restaurant = Restaurant()
-        restaurant.name = name
-        restaurant.street_address = street_address
-        restaurant.description = description
-        db.session.add(restaurant)
-        db.session.commit()
+        image_url = None
 
-        return redirect(url_for('details', id=restaurant.id))
+    restaurant = Restaurant(name=name, description=description, image=image_url)
+    db.session.add(restaurant)
+    db.session.commit()
+    flash('Restaurant added successfully!')
+    return redirect(url_for('index'))
 
-@app.route('/review/<int:id>', methods=['POST'])
-@csrf.exempt
+@app.route('/add_review/<int:id>', methods=['POST'])
 def add_review(id):
+    restaurant = Restaurant.query.get_or_404(id)
+    rating = int(request.form['rating'])
+    comment = request.form['comment']
+
+    review = Review(restaurant_id=restaurant.id, rating=rating, comment=comment)
+    db.session.add(review)
+    db.session.commit()
+    flash('Review added successfully!')
+    return redirect(url_for('details', id=restaurant.id))
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    file = request.files['file']
+    if file:
+        blob_client = container_client.get_blob_client(file.filename)
+        blob_client.upload_blob(file, overwrite=True)
+        return f"File '{file.filename}' uploaded successfully!"
+    return "No file selected", 400
+
+@app.route('/download/<filename>', methods=['GET'])
+def download_file(filename):
     try:
-        user_name = request.values.get('user_name')
-        rating = request.values.get('rating')
-        review_text = request.values.get('review_text')
-    except (KeyError):
-        #Redisplay the question voting form.
-        return render_template('add_review.html', {
-            'error_message': "Error adding review",
-        })
-    else:
-        review = Review()
-        review.restaurant = id
-        review.review_date = datetime.now()
-        review.user_name = user_name
-        review.rating = int(rating)
-        review.review_text = review_text
-        db.session.add(review)
-        db.session.commit()
-
-    return redirect(url_for('details', id=id))
-
-@app.context_processor
-def utility_processor():
-    def star_rating(id):
-        reviews = Review.query.where(Review.restaurant == id)
-
-        ratings = []
-        review_count = 0
-        for review in reviews:
-            ratings += [review.rating]
-            review_count += 1
-
-        avg_rating = sum(ratings) / len(ratings) if ratings else 0
-        stars_percent = round((avg_rating / 5.0) * 100) if review_count > 0 else 0
-        return {'avg_rating': avg_rating, 'review_count': review_count, 'stars_percent': stars_percent}
-
-    return dict(star_rating=star_rating)
+        blob_client = container_client.get_blob_client(filename)
+        blob_data = blob_client.download_blob()
+        return send_file(
+            blob_data.readall(),
+            as_attachment=True,
+            download_name=filename
+        )
+    except Exception as e:
+        return f"Error downloading the file: {str(e)}", 404
 
 @app.route('/favicon.ico')
 def favicon():
-    return send_from_directory(os.path.join(app.root_path, 'static'),
-                               'favicon.ico', mimetype='image/vnd.microsoft.icon')
+    return redirect(url_for('static', filename='favicon.ico'))
 
+# Run the application
 if __name__ == '__main__':
-    app.run()
+    app.run(debug=True)
